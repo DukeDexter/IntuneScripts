@@ -1,0 +1,161 @@
+<#
+.SYNOPSIS
+    Script to deploy custom background images and XML configuration to MTR devices.
+ 
+.DESCRIPTION
+    Script to deploy custom background images and XML configuration to MTR devices
+ 
+.DEPENDENCIES
+    background Images
+    SkypeSettings.xml
+ 
+.INPUTS
+    None
+ 
+.OUTPUTS
+    Generates a log file for every execution under : C:\Program Files(x86)\JLR\Pkglogs\JLR_MTR_Wallpaper_1.0_JLRV1_EN_GB_216
+ 
+.EXAMPLE
+    Powershell.exe -ExecutionPolicy Bypass -File .\Install.ps1
+ 
+    *Considering Work directory is set to the folder of Install.ps1
+#>
+ 
+ 
+Function Create_Logs
+{
+    Param(
+        [Parameter(Mandatory = $True)][String]$LogFiles_Path,
+        [Parameter(Mandatory = $True)][String]$LogFile
+    )
+    try
+    {
+        if (-not (Test-Path -Path $LogFiles_Path))
+        {
+            New-Item -Path $LogFiles_Path -ItemType Directory -Force
+            Write-Host "Log directory created."
+        }
+        New-Item -Path $LogFile -ItemType File -Force
+        Write-Host "Log file created."
+        return $True
+    }
+    catch
+    {
+        Write-Host "Log file creation failed."
+        return $False
+    }
+}
+# Function to write logs
+function Write-Log
+{
+    param
+    (
+        [Parameter(Mandatory = $True)][string]$message,
+        [Parameter(Mandatory = $false)][string]$type
+    )
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logEntry = "[$timestamp] [$type] $message"
+    Add-Content -Path $logFile -Value $logEntry
+    Write-Output $logEntry
+}
+ 
+# ----------[ Variables ]----------
+If($PSVersionTable.PSVersion.Major -ge 3)
+{
+    [String]$CurrentDirectory = $PSScriptRoot
+}
+Else
+{
+    [String]$CurrentDirectory = Split-Path -Parent -Path $MyInvocation.MyCommand.Definition
+}
+ 
+ 
+#[string]$localStatePath = "C:\Users\Skype\AppData\Local\Packages\Microsoft.SkypeRoomSystem_8wekyb3d8bbwe\LocalState"
+ 
+#[string]$sourceFolder = "$($CurrentDirectory)\files"  # Folder containing source images and XML
+ 
+$Image_Path = @(
+        @{ ImageName = "Dual MTR.jpg"; blobPath = "https://zkspmacmgmttools.blob.core.windows.net/zkspmacmgmttoolsshared/Dual%20MTR.jpg?sp=r&st=2025-08-05T10:57:12Z&se=2026-08-01T19:12:12Z&spr=https&sv=2024-11-04&sr=b&sig=0YQFpsnzKAYRXh6DBy6PFqhuT%2BXyy6b1ZQHIAcqSJH8%3D%22}
+         )
+ 
+[string]$xmlFilePath = "https://zkspmacmgmttools.blob.core.windows.net/zkspmacmgmttoolsshared/SkypeSettings2025.xml?sp=r&am…
+ 
+[string]$logFolder = "C:\Program Files (x86)\JLR\Pkglogs\JLR_MTR_Wallpaper_1.0_JLRV1_EN_GB_216"
+ 
+[string]$logFile = "$logFolder\Update_$(Get-Date -Format 'dd-MM-yyyy').log"
+ 
+[string]$Application_Detection = "HKLM:\SOFTWARE\JLR\Applications\MTRWallpaperDeploy"
+ 
+[string]$Property_Name = "BackgroundDeployed"
+ 
+[boolean]$bool_Xml=$false
+ 
+[boolean]$bool_Image=$false
+# ----------[ Deployment Logic ]----------
+try
+{
+    
+ 
+    #Check if pkglogs folder exist or not
+    if(!(Test-Path -Path "C:\Program Files (x86)\JLR\Pkglogs"))
+    {
+        if(!(Test-Path -Path "C:\Program Files (x86)\JLR"))
+        {
+            New-Item -Path "C:\Program Files (x86)\" -Name "JLR" -ItemType Directory -Force -ErrorAction Stop
+        }
+        New-Item -Path "C:\Program Files (x86)\JLR" -Name "Pkglogs" -ItemType Directory -Force -ErrorAction Stop
+    }
+    $Log_status = Create_Logs -LogFiles_Path $logFolder -LogFile $logFile
+ 
+ 
+    if((Test-Path -Path $Application_Detect) -eq $false)
+    {
+        New-Item -Path "HKLM:\SOFTWARE\JLR\Applications\" -Name "$($Application_Detect.Split("\")[-1])" -Force -ErrorAction Stop
+        New-ItemProperty -Path $Application_Detect -Name $Property_Name -Value "False" -PropertyType "String" -Force -ErrorAction Stop
+    }
+    
+    [String[]]$UserProfiles = Get-ChildItem -Path "$($env:SystemDrive)\Users" -ErrorAction SilentlyContinue -Exclude @('Default', 'Public') | Select-Object -ExpandProperty FullName    
+    
+    Write-Log "Deployment started."
+ 
+    ForEach($UserProfile In $UserProfiles)
+    {
+        $Destination = "$($UserProfile)\Appdata\local\Packages\$(Get-ChildItem -Path "$($UserProfile)\Appdata\local\Packages\" | Where{$_.Name.StartsWith('Microsoft.SkypeRoomSystem')} | Select-Object -ExpandProperty Name)\LocalState"
+        If((Test-Path -Path $Destination -ErrorAction SilentlyContinue))
+        {
+            foreach ($image in $Image_Path)
+            {
+                Invoke-WebRequest -Uri $image.blobpath -UseBasicParsing | Select -ExpandProperty Content | Out-File -FilePath "$($Destination)\Dual MTR.jpg" -Force -ErrorAction SilentlyContinue
+                If(Test-Path -Path "$($Destination)\$image.ImageName" -ErrorAction SilentlyContinue)
+                {
+                    Write-Log "Successfully downloaded the $($image.ImageName) to ""$($Destination)"""
+                }
+                Else
+                {
+                    Write-Log "Failed to download the $($image.ImageName) to ""$($Destination)"""
+                }
+ 
+            }
+            Invoke-WebRequest -Uri $xmlFilePath -UseBasicParsing | Select -ExpandProperty Content | Out-File -FilePath "$($Destination)\SkypeSettings.xml" -Force -ErrorAction SilentlyContinue   
+            If(Test-Path -Path "$($Destination)\SkypeSettings.xml" -ErrorAction SilentlyContinue)
+            {
+                Write-Log "Successfully downloaded the Sky configuration xml to ""$($Destination)"""             
+            }
+            Else
+            {
+                Write-Log "Failed to download the Sky configuration xml to ""$($Destination)"""
+            }
+ 
+        }
+        Else
+        {
+            Write-Log "Destination location:  ""$($Destination)"" does not exist"
+        }
+ 
+    }
+}
+Catch
+{
+     Write-Log "Error encountered: $_"
+}
+    
