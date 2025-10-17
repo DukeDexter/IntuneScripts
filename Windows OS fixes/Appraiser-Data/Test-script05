@@ -1,0 +1,99 @@
+# Full Compliance Script: Appraiser Refresh + Intune Validation + Auto-Remediation + Update Readiness + Health Attestation
+$TaskName = "\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser"
+$LogFile = "C:\Temp\ComplianceCheck.log"
+$ReportFile = "C:\Temp\ComplianceReport.csv"
+
+# Ensure directories exist
+if (!(Test-Path "C:\Temp")) { New-Item -ItemType Directory -Path "C:\Temp" }
+
+# Initialize report array
+$Report = @()
+
+Add-Content $LogFile "`n[$(Get-Date)] Starting compliance checks..."
+
+# --- Check Appraiser Task ---
+$AppraiserStatus = "OK"
+$task = Get-ScheduledTask -TaskName "Microsoft Compatibility Appraiser" -TaskPath "\Microsoft\Windows\Application Experience\" -ErrorAction SilentlyContinue
+if ($task) {
+    $info = Get-ScheduledTaskInfo -TaskName "Microsoft Compatibility Appraiser" -TaskPath "\Microsoft\Windows\Application Experience\"
+    if (([datetime]::Now - $info.LastRunTime).Days -gt 7 -or $info.LastTaskResult -ne 0) {
+        schtasks /run /tn $TaskName | Out-Null
+        $AppraiserStatus = "Refreshed"
+    }
+} else {
+    $AppraiserStatus = "Missing"
+    sfc /scannow
+    DISM /Online /Cleanup-Image /RestoreHealth
+}
+
+# --- Validate Intune Enrollment ---
+$dsreg = dsregcmd /status
+$aadJoined = ($dsreg | Select-String "AzureAdJoined").ToString()
+$enterpriseJoined = ($dsreg | Select-String "EnterpriseJoined").ToString()
+$mdmUrl = ($dsreg | Select-String "MdmUrl").ToString()
+$prtStatus = ($dsreg | Select-String "AzureAdPrt").ToString()
+
+$EnrollmentStatus = "Healthy"
+$RemediationAction = "None"
+
+if ($aadJoined -notmatch "YES" -or $enterpriseJoined -notmatch "YES" -or $mdmUrl -notmatch "manage.microsoft.com") {
+    $EnrollmentStatus = "Broken"
+    try {
+        dsregcmd /leave
+        Restart-Computer -Force
+        dsregcmd /join
+        $RemediationAction = "Rejoined AAD"
+    } catch {
+        $RemediationAction = "Failed"
+    }
+}
+
+# --- Trigger Intune Sync ---
+Invoke-Expression "Start-Process -FilePath 'IntuneManagementExtension.exe' -ArgumentList '-sync' -NoNewWindow"
+
+# --- Windows Update Readiness ---
+$WUReadiness = "Unknown"
+try {
+    $WUScan = (Get-WindowsUpdateLog)
+    if ($WUScan -match "Feature update eligibility") {
+        $WUReadiness = "Eligible"
+    } elseif ($WUScan -match "Not eligible") {
+        $WUReadiness = "NotEligible"
+    }
+} catch {
+    $WUReadiness = "CheckFailed"
+}
+
+# --- Health Attestation Validation ---
+$HealthStatus = "Unknown"
+try {
+    $HealthCheck = Get-CimInstance -Namespace root\\cimv2\\mdm\\dmmap -ClassName MDM_HealthAttestation
+    if ($HealthCheck.HealthStatus -eq "Attestable") {
+        $HealthStatus = "Healthy"
+    } else {
+        $HealthStatus = "Failed"
+    }
+} catch {
+    $HealthStatus = "Unavailable"
+}
+
+# --- Build Report Row ---
+$Report += [PSCustomObject]@{
+    DeviceName        = $env:COMPUTERNAME
+    AppraiserStatus   = $AppraiserStatus
+    AADJoined         = if ($aadJoined -match "YES") {"YES"} else {"NO"}
+    EnterpriseJoined  = if ($enterpriseJoined -match "YES") {"YES"} else {"NO"}
+    MDMUrl            = if ($mdmUrl -match "manage.microsoft.com") {"Present"} else {"Missing"}
+    PRTStatus         = if ($prtStatus -match "YES") {"YES"} else {"NO"}
+    EnrollmentStatus  = $EnrollmentStatus
+    RemediationAction = $RemediationAction
+    WUReadiness       = $WUReadiness
+    HealthStatus      = $HealthStatus
+    Timestamp         = (Get-Date)
+}
+
+# Export report
+$Report | Export-Csv -Path $ReportFile -NoTypeInformation
+Add-Content $LogFile "Report saved to $ReportFile"
+
+Write-Host "Compliance check complete. Log: $LogFile | Report: $ReportFile"
