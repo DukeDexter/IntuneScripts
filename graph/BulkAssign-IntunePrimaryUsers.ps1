@@ -12,7 +12,7 @@ param(
   [string]$ExcludeUpnPattern,
   [switch]$DryRun,
   [string]$OutputDir = ".",
-  [string]$GraphEndpoint = "https://graph.microsoft.com"  # For 21Vianet tenants, use https://microsoftgraph.chinacloudapi.cn
+  [string]$GraphEndpoint = "https://graph.microsoft.com"  # For 21Vianet tenants: https://microsoftgraph.chinacloudapi.cn
 )
 
 # -------------------- Helper: Get Token --------------------
@@ -105,9 +105,9 @@ $token=Get-GraphToken -TenantId $TenantId -ClientId $ClientId -ClientSecret $Cli
 $headers=@{"Authorization"="Bearer $token"}
 
 # -------------------- Fetch Sign-ins (safe filter & encoding) --------------------
-# Graph expects DateTimeOffset literals in single quotes; encode all query params
+# Graph expects DateTimeOffset literals WITHOUT quotes in filters: createdDateTime ge 2025-10-21T09:51:07Z
 $startUtc = (Get-Date).AddDays(-$LookbackDays).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-$filterRaw = "createdDateTime ge '$startUtc'"
+$filterRaw = "createdDateTime ge $startUtc"
 $filterEnc = [uri]::EscapeDataString($filterRaw)
 $selectEnc = [uri]::EscapeDataString("createdDateTime,userId,userPrincipalName,deviceDetail")
 $topEnc    = [uri]::EscapeDataString("1000")
@@ -177,7 +177,7 @@ if($assignments.Count -eq 0){
 # -------------------- Resolve managedDevices --------------------
 function Get-ManagedDeviceByAadId{
   param($AadDeviceId,$Headers,$GraphEndpoint)
-  $filterEnc = [uri]::EscapeDataString("azureADDeviceId eq '$AadDeviceId'")
+  $filterEnc = [uri]::EscapeDataString("azureADDeviceId eq '$AadDeviceId'")  # string values need quotes
   $selectEnc = [uri]::EscapeDataString("id,deviceName,userId,userPrincipalName")
   $uri="$GraphEndpoint/v1.0/deviceManagement/managedDevices?%24filter=$filterEnc&%24select=$selectEnc&%24top=1"
   Invoke-Graph -Method GET -Uri $uri -Headers $Headers
