@@ -7,16 +7,6 @@
     - AuditLog.Read.All
     - DeviceManagementManagedDevices.ReadWrite.All
     - Directory.Read.All (optional for user lookups)
-
-.How-to-run
-
-.\BulkAssign-IntunePrimaryUsers.ps1 `
-  -TenantId "contoso.com" `
-  -ClientId "00000000-0000-0000-0000-000000000000" `
-  -ClientSecret "YourSuperSecretValue" `
-  -LookbackDays 30 `
-  -DryRun   # Remove this switch to apply changes
-
 #>
 
 param(
@@ -28,23 +18,28 @@ param(
   [switch]$DryRun
 )
 
-# Install required modules if missing
+# Install required module if missing
 if (-not (Get-Module -ListAvailable -Name Microsoft.Graph)) {
     Install-Module Microsoft.Graph -Scope CurrentUser -Force
 }
 
-# Connect using App Authentication
-Connect-MgGraph -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
-Select-MgProfile -Name "v1.0"
+# Create PSCredential for app authentication
+$secureSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
+$credential = New-Object System.Management.Automation.PSCredential($ClientId, $secureSecret)
 
-Write-Host "Connected to Microsoft Graph as App." -ForegroundColor Green
+# Connect using app-only authentication
+Write-Host "Connecting to Microsoft Graph using app credentials..." -ForegroundColor Cyan
+Connect-MgGraph -TenantId $TenantId -ClientSecretCredential $credential
+Write-Host "Connected successfully." -ForegroundColor Green
 
 # Fetch sign-in logs for last 30 days
 $startDate = (Get-Date).AddDays(-$LookbackDays).ToString("o")
+Write-Host "Fetching sign-in logs since $startDate..." -ForegroundColor Cyan
+
 $signIns = Get-MgAuditLogSignIn -Filter "createdDateTime ge $startDate and status/errorCode eq 0" -All `
     -Property @('createdDateTime','userId','userPrincipalName','deviceDetail/deviceId','deviceDetail/displayName')
 
-# Aggregate by device
+# Aggregate activity
 $activity = $signIns | Where-Object { $_.DeviceDetail.DeviceId } | ForEach-Object {
     [pscustomobject]@{
         DeviceAadId       = $_.DeviceDetail.DeviceId
