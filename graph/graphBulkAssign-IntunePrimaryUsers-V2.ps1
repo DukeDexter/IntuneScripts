@@ -2,35 +2,30 @@
 Bulk assign Intune primary users based on last N days of sign-ins via Microsoft Graph REST.
 Features:
  - Token refresh on 401
- - Defensive paging with progress + max pages
+ - Defensive paging with progress + max pages cap
  - Fallback (unfiltered) query when filtered returns no data
  - Batched OR Parallel assignments (PS7+)
  - Per-item retries + backoff, detailed errors
  - File logging + CSV audit
  - Checkpoint resume (PowerShell 5.1 compatible)
-#>
 
-param(
-  # Auth & scope
-  [Parameter(Mandatory)][string]$TenantId,
-  [Parameter(Mandatory)][string]$ClientId,
-  [Parameter(Mandatory)][string]$ClientSecret,
-
-  # Activity window & selection
-  [int]$LookbackDays = 30,
-  [int]$MinEventsPerDevice = 2,
-  [string]$ExcludeUpnPattern,
-
-  # Execution mode
-  [switch]$DryRun,
-
+USAGE (safe preview first):
+.\BulkAssign-IntunePrimaryUsers.ps1 `
+  -TenantId "contoso.com" `
+  -ClientId "11111111-2222-3333-4444-555555555555" `
+  -ClientSecret "SuperSecretValue" `
+  -LookbackDays 30 `
+  -MinEventsPerDevice 3 `
+  -BatchSize 50 `
+  -MaxPages 100 `
+  -DryRun `
   # IO paths
   [string]$OutputDir = ".",
   [string]$LogPath = ".\BulkAssign-PrimaryUsers.log",
   [string]$CheckpointPath = ".\PrimaryUserCheckpoint.json",
   [switch]$Resume,
 
-  # Graph endpoints
+  # Graph endpoint
   [string]$GraphEndpoint = "https://graph.microsoft.com",  # 21Vianet: https://microsoftgraph.chinacloudapi.cn
 
   # Paging
@@ -47,7 +42,7 @@ param(
   [int]$ThrottleLimit = 8
 )
 
-# -------------------- PS 5.1 TLS note (safe to run in PS7 too) --------------------
+# -------------------- PS 5.1 TLS (safe in PS7 too) --------------------
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
 # -------------------- Logging --------------------
@@ -350,7 +345,10 @@ function Invoke-Assign {
     [int]$MaxRetries,
     [int]$DelayMs,
     [string]$GraphEndpoint,
-    [string]$LogPathLocal
+    [string]$LogPathLocal,
+    [string]$TenantId,
+    [string]$ClientId,
+    [string]$ClientSecret
   )
 
   function LogLocal([string]$lvl,[string]$msg) {
@@ -385,7 +383,7 @@ function Invoke-Assign {
         }
         if ($status -eq 401 -and ($respBody -match 'InvalidAuthenticationToken' -or $respBody -match 'token is expired' -or $respBody -match 'Lifetime validation failed')) {
           LogLocal "WARN" "401 in worker; refreshing token and retrying attempt $attempt for device $($Row.ManagedDeviceId)."
-          $newTok = Get-GraphToken -TenantId $using:TenantId -ClientId $using:ClientId -ClientSecret $using:ClientSecret -GraphEndpoint $using:GraphEndpoint
+          $newTok = Get-GraphToken -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -GraphEndpoint $GraphEndpoint
           $Headers["Authorization"] = "Bearer $newTok"
           Start-Sleep -Milliseconds $DelayMs
           continue
@@ -426,33 +424,42 @@ if ($Resume -and -not $DryRun) {
 }
 
 if ($UseParallel -and $PSVersionTable.PSVersion.Major -ge 7) {
-  # Handle skips
+  # Handle skips up-front
   $skips = $work | Where-Object { $_.Action -like "Skip_*" }
   foreach ($s in $skips) { $s.Result = $s.Action; $results += $s }
+
+  # Only actionable items go to parallel
   $toAssign = $work | Where-Object { $_.Action -eq "Assign_PrimaryUser" }
 
+  # Pass immutable auth header value into parallel workers
   $authVal = $script:Headers['Authorization']
-  $assignedIds = New-Object System.Collections.Concurrent.ConcurrentBag[string]
 
-  $results += $toAssign | ForEach-Object -Parallel {
+  # Run workers and COLLECT their outputs (no shared-state mutation inside workers)
+  $parResults = $toAssign | ForEach-Object -Parallel {
       param($item)
       $hdrs = @{ 'Authorization' = $using:authVal }
-      $out  = Invoke-Assign -Row $item -Headers $hdrs -MaxRetries $using:AssignmentMaxRetries `
-              -DelayMs $using:AssignmentDelayMs -GraphEndpoint $using:GraphEndpoint -LogPathLocal $using:LogPath
-      if ($out.Result -eq 'Success_Assigned' -and $out.ManagedDeviceId) { $using:assignedIds.Add($out.ManagedDeviceId) }
-      $out
+      Invoke-Assign -Row $item -Headers $hdrs -MaxRetries $using:AssignmentMaxRetries `
+                    -DelayMs $using:AssignmentDelayMs -GraphEndpoint $using:GraphEndpoint `
+                    -LogPathLocal $using:LogPath -TenantId $using:TenantId -ClientId $using:ClientId -ClientSecret $using:ClientSecret
     } -ThrottleLimit ([Math]::Max(1,$ThrottleLimit))
 
-  # Save checkpoint once (successes only)
+  # Merge results from workers with earlier 'skip' rows
+  $results += $parResults
+
+  # Save checkpoint ONCE (successes only), outside the parallel block
   if (-not $DryRun) {
+    $successIds = $parResults |
+      Where-Object { $_.Result -eq 'Success_Assigned' -and $_.ManagedDeviceId } |
+      Select-Object -ExpandProperty ManagedDeviceId -Unique
+
     $existing = @()
     if ($Resume) { $existing = $processedSet.Keys }
-    $finalSet = ($existing + $assignedIds.ToArray()) | Select-Object -Unique
+    $finalSet = ($existing + $successIds) | Select-Object -Unique
     Save-Checkpoint -Path $CheckpointPath -ManagedDeviceIds $finalSet
   }
 
 } else {
-  # Sequential in batches with progress & pauses
+  # -------------------- Sequential with batches, progress & pauses -----------
   $batches   = [Math]::Ceiling($work.Count / [Math]::Max(1,$BatchSize))
   $processed = 0
   $successIds = @()
@@ -462,7 +469,8 @@ if ($UseParallel -and $PSVersionTable.PSVersion.Major -ge 7) {
     $end   = [Math]::Min($start + $BatchSize, $work.Count)
     $batch = $work[$start..($end-1)]
 
-    Write-Progress -Id 2 -Activity "Assigning primary users (batch $($b+1)/$batches)" -Status "Items $start..$(($end-1))" -PercentComplete ([Math]::Min(100,(($b+1)/$batches)*100))
+    Write-Progress -Id 2 -Activity "Assigning primary users (batch $($b+1)/$batches)" `
+      -Status "Items $start..$(($end-1))" -PercentComplete ([Math]::Min(100,(($b+1)/$batches)*100))
     Write-Log -Level INFO -Message "Processing batch $($b+1)/$batches (items $start..$(($end-1)))"
 
     foreach ($row in $batch) {
@@ -471,7 +479,8 @@ if ($UseParallel -and $PSVersionTable.PSVersion.Major -ge 7) {
 
       $localHeaders = @{'Authorization' = $script:Headers['Authorization']}
       $out = Invoke-Assign -Row $row -Headers $localHeaders -MaxRetries $AssignmentMaxRetries `
-              -DelayMs $AssignmentDelayMs -GraphEndpoint $GraphEndpoint -LogPathLocal $LogPath
+              -DelayMs $AssignmentDelayMs -GraphEndpoint $GraphEndpoint -LogPathLocal $LogPath `
+              -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
       $results += $out
       if ($out.Result -eq 'Success_Assigned' -and $out.ManagedDeviceId) { $successIds += $out.ManagedDeviceId }
       $processed++
@@ -480,7 +489,7 @@ if ($UseParallel -and $PSVersionTable.PSVersion.Major -ge 7) {
 
     Write-Progress -Id 2 -Activity "Assigning primary users (batch $($b+1)/$batches)" -Completed
 
-    # Save checkpoint after each batch (successes only; cumulative)
+    # Save checkpoint after each sequential batch (successes only; cumulative)
     if (-not $DryRun) {
       $existing = @()
       if ($Resume) { $existing = $processedSet.Keys }
@@ -507,4 +516,26 @@ if (Test-Path $errPath -and (Get-Item $errPath).Length -gt 0) {
 } else {
   Remove-Item $errPath -ErrorAction SilentlyContinue
   Write-Log -Level INFO -Message "Completed successfully."
-}
+} -UseParallel `
+  -ThrottleLimit 8 `
+  -LogPath "C:\Intune\PrimaryUser\bulkassign.log" `
+  -OutputDir "C:\Intune\PrimaryUser" `
+  -CheckpointPath "C:\Intune\PrimaryUser\checkpoint.json" `
+  -Resume
+#>
+
+param(
+  # Auth & scope
+  [Parameter(Mandatory)][string]$TenantId,
+  [Parameter(Mandatory)][string]$ClientId,
+  [Parameter(Mandatory)][string]$ClientSecret,
+
+  # Activity window & selection
+  [int]$LookbackDays = 30,
+  [int]$MinEventsPerDevice = 2,
+  [string]$ExcludeUpnPattern,
+
+  # Execution mode
+  [switch]$DryRun,
+
+ 
