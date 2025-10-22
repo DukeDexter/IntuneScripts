@@ -3,51 +3,52 @@
 # =========================
 # Purpose:
 #   Bulk-assign Intune primary users based on last N days of sign-in activity.
-#   Uses Microsoft Graph REST (no Microsoft.Graph module), supports PS 5.1 & 7+.
-#   Includes token refresh, paging, fallback, batching/parallel, retries, logging, and checkpoint resume.
+#   Pure Microsoft Graph REST (no Microsoft.Graph module) => fewer dependencies and avoids function-capacity issues.
+#   Supports PowerShell 5.1 (sequential) and 7+ (optional parallel).
+#   Includes: token refresh, defensive paging, fallback querying, batching/parallel, per-item retries, logging, CSV audit, checkpoint resume.
 
 param(
-  # --- Auth & scope ---
-  [Parameter(Mandatory)][string]$TenantId,
-  [Parameter(Mandatory)][string]$ClientId,
-  [Parameter(Mandatory)][string]$ClientSecret,
+  # --- Authentication / App Registration ---
+  [Parameter(Mandatory)][string]$TenantId,      # Tenant GUID or primary domain (e.g., contoso.com)
+  [Parameter(Mandatory)][string]$ClientId,      # Entra App Registration - Application (client) ID
+  [Parameter(Mandatory)][string]$ClientSecret,  # App client secret (use secure storage in production)
 
-  # --- Data selection ---
-  [int]$LookbackDays = 30,          # Number of days of sign-ins to consider
-  [int]$MinEventsPerDevice = 2,     # Minimum successful sign-ins by a user on a device to qualify as 'primary'
-  [string]$ExcludeUpnPattern,       # Regex to exclude service/bot accounts (e.g. '^(svc-|system_)')
+  # --- Data window & selection rules ---
+  [int]$LookbackDays = 30,          # Sign-ins considered in past N days
+  [int]$MinEventsPerDevice = 2,     # Min successful sign-ins by the "winner" on a device
+  [string]$ExcludeUpnPattern,       # Regex to exclude UPNs (e.g., '^(svc-|system_)')
 
   # --- Execution mode ---
-  [switch]$DryRun,                  # Preview only; do not commit primary user changes
+  [switch]$DryRun,                  # If set: preview changes, do not commit primary user assignments
 
-  # --- IO paths ---
-  [string]$OutputDir = ".",         # Folder for CSV outputs
-  [string]$LogPath = ".\BulkAssign-PrimaryUsers.log",         # Log file path
-  [string]$CheckpointPath = ".\PrimaryUserCheckpoint.json",   # Checkpoint file for resume
-  [switch]$Resume,                  # Skip devices already processed in prior runs
+  # --- IO / Paths ---
+  [string]$OutputDir = ".",         # Folder for outputs (CSV files)
+  [string]$LogPath = ".\BulkAssign-PrimaryUsers.log",          # Script log
+  [string]$CheckpointPath = ".\PrimaryUserCheckpoint.json",    # JSON array of managedDeviceId (successes)
+  [switch]$Resume,                  # If set: skip devices already in checkpoint file
 
-  # --- Graph endpoint (global cloud default; 21Vianet tenants override) ---
-  [string]$GraphEndpoint = "https://graph.microsoft.com",
+  # --- Graph environment ---
+  [string]$GraphEndpoint = "https://graph.microsoft.com",  # 21Vianet: https://microsoftgraph.chinacloudapi.cn
 
-  # --- Paging caps & progress ---
-  [int]$MaxPages = 200,             # Defensive cap on how many pages to fetch from Graph
+  # --- Paging / Progress ---
+  [int]$MaxPages = 200,             # Defensive cap on the number of pages fetched
 
-  # --- Assignment orchestration ---
-  [int]$BatchSize = 100,            # Sequential batch size (ignored in parallel mode)
-  [int]$AssignmentDelayMs = 200,    # Delay between assignment POSTs (helps avoid throttling)
+  # --- Assignment control (sequential) ---
+  [int]$BatchSize = 100,            # Number of devices per batch in sequential mode
+  [int]$AssignmentDelayMs = 200,    # Delay between POSTs (helps avoid throttling)
   [int]$BatchPauseSeconds = 2,      # Pause between sequential batches
-  [int]$AssignmentMaxRetries = 3,   # Per-item retries with linear backoff
+  [int]$AssignmentMaxRetries = 3,   # Per-item POST retry attempts (linear backoff)
 
-  # --- Parallel (PS 7+) ---
-  [switch]$UseParallel,             # Use ForEach-Object -Parallel (requires PowerShell 7+)
-  [int]$ThrottleLimit = 8           # Max concurrent assignments in parallel mode
+  # --- Parallel (PowerShell 7+ only) ---
+  [switch]$UseParallel,             # Opt-in to ForEach-Object -Parallel
+  [int]$ThrottleLimit = 8           # Max concurrent operations in parallel mode
 )
 
-# Force TLS 1.2 (especially relevant on PS 5.1)
+# Force TLS 1.2 (important on PS 5.1; harmless on PS 7+)
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
 # --------------------
-# Logging helper (file-based)
+# Logging helper (writes to $LogPath)
 # --------------------
 function Write-Log {
   param(
@@ -59,11 +60,11 @@ function Write-Log {
 }
 
 # --------------------
-# Checkpoint helpers (resume support across runs)
+# Checkpoint helpers (store/read successful managedDeviceId assignments)
 # --------------------
 function Load-Checkpoint {
   param([string]$Path)
-  if (-not (Test-Path $Path)) { return @{} }
+  if (-not (Test-Path $Path)) { return @{} }    # Return empty set if missing
   try {
     $json = Get-Content -Path $Path -Raw -ErrorAction Stop
     $data = ConvertFrom-Json -InputObject $json
@@ -90,47 +91,90 @@ function Save-Checkpoint {
   }
 }
 
-# Ensure output folder & log file exist
+# Ensure output locations exist (idempotent)
 if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir | Out-Null }
 New-Item -ItemType File -Path $LogPath -Force | Out-Null
 Write-Log -Level INFO -Message "Start. Tenant=$TenantId LookbackDays=$LookbackDays DryRun=$DryRun UseParallel=$UseParallel Resume=$Resume"
 
-# Script-scope copies for helper functions
+# Script-scope copies for helpers (used by token refresh logic)
 $script:TenantId      = $TenantId
 $script:ClientId      = $ClientId
 $script:ClientSecret  = $ClientSecret
 $script:GraphEndpoint = $GraphEndpoint
-$script:Headers       = @{}  # Will be populated after initial token
+$script:Headers       = @{}  # Populated after initial token
 
 # --------------------
-# Access token acquisition (client credentials)
+# Obtain an access token using client credentials (app authentication)
 # --------------------
 function Get-GraphToken {
   param($TenantId,$ClientId,$ClientSecret,$GraphEndpoint)
 
-  $status = [int]$_.Exception.Response.StatusCode
+  # Use partner login host for 21Vianet tenants; otherwise global
+  $tokenUri = ($GraphEndpoint -like "*chinacloudapi.cn*") ?
+              "https://login.partner.microsoftonline.cn/$TenantId/oauth2/v2.0/token" :
+              "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+
+  $body = @{
+    client_id     = $ClientId
+    client_secret = $ClientSecret
+    grant_type    = "client_credentials"
+    scope         = "$GraphEndpoint/.default"
+  }
+
+  try {
+    $tok = Invoke-RestMethod -Method POST -Uri $tokenUri -Body $body -ContentType "application/x-www-form-urlencoded"
+    Write-Log -Level INFO -Message "Access token obtained."
+    return $tok.access_token
+  } catch {
+    Write-Log -Level ERROR -Message "Token request failed: $($_.Exception.Message)"
+    throw
+  }
+}
+
+# --------------------
+# Core Graph caller with:
+# - exponential backoff for 429/5xx
+# - token refresh on 401 (invalid/expired)
+# - response body capture for diagnostics
+# --------------------
+function Invoke-Graph {
+  param(
+    [string]$Method, [string]$Uri, [hashtable]$Headers, [object]$Body = $null, [int]$MaxRetries = 6
+  )
+  $attempt = 0
+  while ($true) {
+    try {
+      if ($Method -eq "GET") {
+        return Invoke-RestMethod -Method GET -Uri $Uri -Headers $Headers -ErrorAction Stop
+      } elseif ($Method -eq "POST") {
+        return Invoke-RestMethod -Method POST -Uri $Uri -Headers $Headers -Body $Body -ContentType "application/json" -ErrorAction Stop
+      } else { throw "Unsupported method: $Method" }
+    } catch {
+      $attempt++
+      $status = $null; $retryAfter = 0; $respBody = $null
+
+      # Pull status/Retry-After/body for debugging
+      if ($_.Exception.Response) {
+        $status = [int]$_.Exception.Response.StatusCode
         try {
           $stream = $_.Exception.Response.GetResponseStream()
-          if ($stream) {
-            $reader = New-Object System.IO.StreamReader($stream)
-            $respBody = $reader.ReadToEnd()
-          }
+          if ($stream) { $reader = New-Object System.IO.StreamReader($stream); $respBody = $reader.ReadToEnd() }
         } catch {}
         $raHdr = $_.Exception.Response.Headers["Retry-After"]
         if ($raHdr) { [int]::TryParse($raHdr, [ref]$retryAfter) | Out-Null }
       }
 
-      # Automatic token refresh on 401 invalid/expired token
+      # Automatic token refresh on 401
       if ($status -eq 401 -and ($respBody -match 'InvalidAuthenticationToken' -or $respBody -match 'token is expired' -or $respBody -match 'Lifetime validation failed')) {
         Write-Log -Level WARN -Message "401 Invalid/Expired token. Refreshing token and retrying..."
         $newTok = Get-GraphToken -TenantId $script:TenantId -ClientId $script:ClientId -ClientSecret $script:ClientSecret -GraphEndpoint $script:GraphEndpoint
         $Headers["Authorization"]     = "Bearer $newTok"
         $script:Headers["Authorization"] = "Bearer $newTok"
-        $attempt--  # Don't count this as a failure; retry immediately
+        $attempt--  # Do not penalize on token refresh
         continue
       }
 
-      # Transient backoff for throttling/server errors
+      # Transient backoff on throttling/server errors
       if ($attempt -le $MaxRetries -and ($status -in 429,500,503,504)) {
         $delay = ($retryAfter -gt 0) ? $retryAfter : [math]::Min(60, [math]::Pow(2, $attempt))
         Write-Log -Level WARN -Message "Transient HTTP $status for $Uri. Retrying in $delay sec... ($attempt/$MaxRetries)"
@@ -138,7 +182,7 @@ function Get-GraphToken {
         continue
       }
 
-      # Hard failure (exhausted retries / non-transient)
+      # Hard fail: bubble up w/ body
       $msg = "Graph call failed (HTTP $status): $($_.Exception.Message)"
       if ($respBody) { $msg = "$msg`nResponse body: $respBody" }
       Write-Log -Level ERROR -Message $msg
@@ -148,7 +192,10 @@ function Get-GraphToken {
 }
 
 # --------------------
-# Paged GET helper: progress + max pages cap + defensive nextLink handling
+# Page through Graph results safely:
+# - Progress bar
+# - Max pages cap
+# - Defensive nextLink handling (skiptoken bugs)
 # --------------------
 function Get-GraphPaged {
   param($Uri,[hashtable]$Headers,[int]$MaxPages,[string]$ActivityName)
@@ -162,7 +209,6 @@ function Get-GraphPaged {
     try {
       $resp = Invoke-Graph -Method GET -Uri $next -Headers $Headers
     } catch {
-      # Stop gracefully on buggy skiptoken nextLink
       if ($_.Exception.Message -match 'Skip token is null|skiptoken') {
         Write-Log -Level WARN -Message "$ActivityName - paging halted due to skiptoken error at page $page."
         break
@@ -186,43 +232,42 @@ function Get-GraphPaged {
 }
 
 # --------------------
-# Initial authentication
+# Initial auth: get token and store Authorization header
 # --------------------
 Write-Host "Authenticating..." -ForegroundColor Cyan
 $firstToken     = Get-GraphToken -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -GraphEndpoint $GraphEndpoint
 $script:Headers = @{ "Authorization" = "Bearer $firstToken" }
 
 # --------------------
-# Build sign-ins query (filtered by createdDateTime >= startUtc)
+# Build sign-ins query filtered by createdDateTime >= startUtc
+# (If filtered returns empty, we fallback to unfiltered and filter client-side)
 # --------------------
 $startUtc  = (Get-Date).AddDays(-$LookbackDays).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 $filterEnc = [uri]::EscapeDataString("createdDateTime ge $startUtc")
-
 $signInsUri = "$GraphEndpoint/v1.0/auditLogs/signIns?%24filter=$filterEnc"
 Write-Log -Level INFO -Message "Sign-ins filtered URI: $signInsUri"
 
-# Fetch filtered sign-ins with paging
 $signIns = Get-GraphPaged -Uri $signInsUri -Headers $script:Headers -MaxPages $MaxPages -ActivityName "Fetching sign-ins (filtered)"
 
-# Fallback: unfiltered query then client-side filtering (time window + success)
 if (-not $signIns -or $signIns.Count -eq 0) {
+  # Fallback path: unfiltered page-through, then client-side filter by time window and success
   Write-Log -Level WARN -Message "Filtered query returned no results. Fallback to unfiltered."
   $fallbackUri = "$GraphEndpoint/v1.0/auditLogs/signIns"
   $signIns     = Get-GraphPaged -Uri $fallbackUri -Headers $script:Headers -MaxPages $MaxPages -ActivityName "Fetching sign-ins (fallback)"
   $startDt     = [datetime]::ParseExact($startUtc,'yyyy-MM-ddTHH:mm:ssZ',$null)
   $signIns     = $signIns | Where-Object { ([datetime]$_.createdDateTime -ge $startDt) -and ($_.status.errorCode -eq 0 -or -not $_.status) }
 } else {
-  # Filter success client-side to avoid nested server-side filter
+  # Keep only successful/federated successful sign-ins
   $signIns = $signIns | Where-Object { $_.status.errorCode -eq 0 -or -not $_.status }
 }
 
 # --------------------
-# Normalize rows; require deviceDetail.deviceId (AAD device GUID)
+# Normalize: we require deviceDetail.deviceId (AAD device GUID) to map to Intune
 # --------------------
 $activity = foreach ($e in $signIns) {
   $devId = $e.deviceDetail.deviceId
-  if ([string]::IsNullOrWhiteSpace($devId)) { continue }                         # must have AAD device GUID
-  if ($ExcludeUpnPattern -and $e.userPrincipalName -match $ExcludeUpnPattern) { continue }   # skip service accounts
+  if ([string]::IsNullOrWhiteSpace($devId)) { continue }                         # must have device GUID
+  if ($ExcludeUpnPattern -and $e.userPrincipalName -match $ExcludeUpnPattern) { continue }  # skip service/bots
   [pscustomobject]@{
     CreatedDateTime   = [datetime]$e.createdDateTime
     DeviceAadId       = $devId
@@ -242,7 +287,7 @@ if (-not $activity) {
 }
 
 # --------------------
-# Aggregate winners per device (most active user; tie-breaker by most recent sign-in)
+# Aggregate: choose the most active user per device (tie -> most recent sign-in)
 # --------------------
 $assignments = @()
 $byDevice = $activity | Group-Object DeviceAadId
@@ -251,7 +296,7 @@ foreach ($devGroup in $byDevice) {
   $winner     = $userGroups | Select-Object -First 1
   if ($winner.Count -lt $MinEventsPerDevice) { continue }
 
-  # Tie-breaker: pick the user whose latest sign-in is most recent
+  # Tie-breaker by latest sign-in among tied users
   $ties = $userGroups | Where-Object { $_.Count -eq $winner.Count }
   if ($ties.Count -gt 1) {
     $winner = $ties |
@@ -279,11 +324,11 @@ if ($assignments.Count -eq 0) {
 }
 
 # --------------------
-# Resolve Intune managedDevice using azureADDeviceId
+# Lookup Intune managedDevice via azureADDeviceId
 # --------------------
 function Get-ManagedDeviceByAadId {
   param($AadDeviceId,[hashtable]$Headers,$GraphEndpoint)
-  $filterEnc = [uri]::EscapeDataString("azureADDeviceId eq '$AadDeviceId'")   # string literal must be quoted in filter
+  $filterEnc = [uri]::EscapeDataString("azureADDeviceId eq '$AadDeviceId'")  # NOTE: string value must be quoted
   $uri       = "$GraphEndpoint/v1.0/deviceManagement/managedDevices?%24filter=$filterEnc"
   Invoke-Graph -Method GET -Uri $uri -Headers $Headers
 }
@@ -296,6 +341,7 @@ foreach ($item in $assignments) {
   if ($resp.value -and $resp.value.Count -ge 1) { $md = $resp.value[0] }
 
   if (-not $md) {
+    # No Intune object -> skip but include in results for audit
     $work += [pscustomobject]@{
       DeviceAadId          = $item.DeviceAadId
       DeviceName           = $item.DeviceName
@@ -328,7 +374,7 @@ foreach ($item in $assignments) {
 }
 
 # --------------------
-# Optional checkpoint resume (skip devices already processed in prior runs)
+# Load checkpoint if resuming (skip already processed IDs in non-DryRun)
 # --------------------
 $processedSet = @{}
 if ($Resume) {
@@ -338,7 +384,7 @@ if ($Resume) {
 }
 
 # --------------------
-# Per-item assignment (POST users/$ref) + local retry + token refresh on 401
+# Per-item assignment: POST users/$ref with robust error handling
 # --------------------
 function Invoke-Assign {
   param(
@@ -353,13 +399,16 @@ function Invoke-Assign {
     [string]$ClientSecret
   )
 
+  # Worker-local logger (useful in parallel workers)
   function LogLocal([string]$lvl,[string]$msg) {
     Add-Content -Path $LogPathLocal -Value "$(Get-Date -Format o) [$lvl] $msg"
   }
 
+  # Early exits: skip rows and missing user
   if ($Row.Action -like "Skip_*") { $Row.Result = $Row.Action; return $Row }
   if ([string]::IsNullOrWhiteSpace($Row.TargetUserId)) { $Row.Result="Error: Missing TargetUserId"; return $Row }
 
+  # Attempt loop with linear backoff; refresh token on 401
   $attempt = 0
   while ($attempt -lt [Math]::Max(1,$MaxRetries)) {
     $attempt++
@@ -371,7 +420,7 @@ function Invoke-Assign {
         Invoke-RestMethod -Method POST -Uri $uri -Headers $Headers -Body $body -ContentType "application/json" -ErrorAction Stop | Out-Null
         $Row.Result="Success_Assigned"; $Row.Attempts=$attempt; return $Row
       } catch {
-        # Local token refresh on 401 within worker
+        # Inspect failure; refresh token locally if 401
         $status=$null; $respBody=$null
         if ($_.Exception.Response) {
           $status=[int]$_.Exception.Response.StatusCode
@@ -380,14 +429,16 @@ function Invoke-Assign {
         if ($status -eq 401 -and ($respBody -match 'InvalidAuthenticationToken' -or $respBody -match 'token is expired' -or $respBody -match 'Lifetime validation failed')) {
           LogLocal "WARN" "401 in worker; refreshing token (attempt $attempt) for $($Row.ManagedDeviceId)"
           $newTok = Get-GraphToken -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -GraphEndpoint $GraphEndpoint
-          $Headers["Authorization"] = "Bearer $newTok"; Start-Sleep -Milliseconds $DelayMs; continue
+          $Headers["Authorization"] = "Bearer $newTok"
+          Start-Sleep -Milliseconds $DelayMs
+          continue
         }
         throw
       }
     } catch {
       LogLocal "WARN" "Attempt $attempt failed for device $($Row.ManagedDeviceId): $($_.Exception.Message)"
       if ($attempt -lt $MaxRetries) {
-        Start-Sleep -Milliseconds ([math]::Max($DelayMs, 100) * $attempt)   # Linear backoff
+        Start-Sleep -Milliseconds ([math]::Max($DelayMs, 100) * $attempt)  # Linear backoff
       } else {
         $Row.Result="Error: $($_.Exception.Message)"; $Row.Attempts=$attempt; return $Row
       }
@@ -396,12 +447,14 @@ function Invoke-Assign {
 }
 
 # --------------------
-# Assignment phase (parallel PS7+ or sequential batches PS5/PS7)
+# Assignment phase
+# - Parallel (PS7+ only) or Sequential (PS5.1/PS7)
+# - Checkpoint resume (non-DryRun)
 # --------------------
 $results = @()
 Write-Log -Level INFO -Message "Starting assignment phase. UseParallel=$UseParallel"
 
-# Apply resume checkpoint (skip already processed) for real runs (not DryRun)
+# Apply checkpoint (skip already processed) only when actually changing things (not in DryRun)
 if ($Resume -and -not $DryRun) {
   $work = $work | Where-Object {
     if ($_.ManagedDeviceId -and $processedSet.ContainsKey($_.ManagedDeviceId)) {
@@ -412,14 +465,14 @@ if ($Resume -and -not $DryRun) {
 }
 
 if ($UseParallel -and $PSVersionTable.PSVersion.Major -ge 7) {
-  # 1) Collect 'skip' rows
+  # --- Parallel mode (PS 7+): collect skips, run workers, merge & checkpoint ---
   $skips = $work | Where-Object { $_.Action -like "Skip_*" }
   foreach ($s in $skips) { $s.Result = $s.Action; $results += $s }
 
-  # 2) Parallel assign for actionable rows
   $toAssign = $work | Where-Object { $_.Action -eq "Assign_PrimaryUser" }
-  $authVal  = $script:Headers['Authorization']
+  $authVal  = $script:Headers['Authorization']  # Immutable string value for $using:
 
+  # Launch workers; each returns its output row (no shared-state mutation inside)
   $parResults = $toAssign | ForEach-Object -Parallel {
       param($item)
       $hdrs = @{ 'Authorization' = $using:authVal }
@@ -428,10 +481,10 @@ if ($UseParallel -and $PSVersionTable.PSVersion.Major -ge 7) {
                     -LogPathLocal $using:LogPath -TenantId $using:TenantId -ClientId $using:ClientId -ClientSecret $using:ClientSecret
     } -ThrottleLimit ([Math]::Max(1,$ThrottleLimit))
 
-  # 3) Merge & checkpoint successes
   $results += $parResults
 
   if (-not $DryRun) {
+    # Save checkpoint once (successes only)
     $successIds = $parResults | Where-Object { $_.Result -eq 'Success_Assigned' -and $_.ManagedDeviceId } |
                   Select-Object -ExpandProperty ManagedDeviceId -Unique
     $existing = @(); if ($Resume) { $existing = $processedSet.Keys }
@@ -440,7 +493,7 @@ if ($UseParallel -and $PSVersionTable.PSVersion.Major -ge 7) {
   }
 
 } else {
-  # Sequential (batched) assignments
+  # --- Sequential mode: process in batches, save checkpoint after each batch ---
   $batches = [Math]::Ceiling($work.Count / [Math]::Max(1,$BatchSize))
   $successIds = @()
 
@@ -456,8 +509,9 @@ if ($UseParallel -and $PSVersionTable.PSVersion.Major -ge 7) {
       if ($row.Action -like "Skip_*") { $row.Result = $row.Action; $results += $row; continue }
       if ($DryRun) { $row.Result = "DryRun_Assign_PrimaryUser"; $results += $row; continue }
 
-      # Clone headers to avoid race during refresh
+      # Clone header for thread-safety if token refresh occurs
       $localHeaders = @{'Authorization' = $script:Headers['Authorization']}
+
       $out = Invoke-Assign -Row $row -Headers $localHeaders -MaxRetries $AssignmentMaxRetries -DelayMs $AssignmentDelayMs `
               -GraphEndpoint $GraphEndpoint -LogPathLocal $LogPath -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret
       $results += $out
@@ -467,8 +521,8 @@ if ($UseParallel -and $PSVersionTable.PSVersion.Major -ge 7) {
 
     Write-Progress -Id 2 -Activity "Assigning primary users (batch $($b+1)/$batches)" -Completed
 
-    # Save checkpoint after each sequential batch (successes only)
     if (-not $DryRun) {
+      # Save checkpoint cumulatively (successes only)
       $existing = @(); if ($Resume) { $existing = $processedSet.Keys }
       $finalSet = ($existing + $successIds) | Select-Object -Unique
       Save-Checkpoint -Path $CheckpointPath -ManagedDeviceIds $finalSet
@@ -479,7 +533,7 @@ if ($UseParallel -and $PSVersionTable.PSVersion.Major -ge 7) {
 }
 
 # --------------------
-# Export results (main + errors CSV) and wrap-up
+# Export results (all + errors) and finish
 # --------------------
 $ts = (Get-Date).ToString('yyyyMMdd_HHmmss')
 $csvPath = Join-Path $OutputDir "PrimaryUserAssignment_$ts.csv"
@@ -495,47 +549,4 @@ if (Test-Path $errPath -and (Get-Item $errPath).Length -gt 0) {
 } else {
   Remove-Item $errPath -ErrorAction SilentlyContinue
   Write-Log -Level INFO -Message "Completed successfully."
-} # Use partner login for 21Vianet tenants, else standard global login
-  $tokenUri = ($GraphEndpoint -like "*chinacloudapi.cn*") ?
-              "https://login.partner.microsoftonline.cn/$TenantId/oauth2/v2.0/token" :
-              "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
-
-  $body = @{
-    client_id     = $ClientId
-    client_secret = $ClientSecret
-    grant_type    = "client_credentials"
-    scope         = "$GraphEndpoint/.default"
-  }
-
-  try {
-    $tok = Invoke-RestMethod -Method POST -Uri $tokenUri -Body $body -ContentType "application/x-www-form-urlencoded"
-    Write-Log -Level INFO -Message "Access token obtained."
-    return $tok.access_token
-  } catch {
-    Write-Log -Level ERROR -Message "Token request failed: $($_.Exception.Message)"
-    throw
-  }
 }
-
-# --------------------
-# Robust Graph call: retries + token refresh on 401 + response body capture
-# --------------------
-function Invoke-Graph {
-  param(
-    [string]$Method, [string]$Uri, [hashtable]$Headers, [object]$Body = $null, [int]$MaxRetries = 6
-  )
-  $attempt = 0
-  while ($true) {
-    try {
-      if ($Method -eq "GET") {
-        return Invoke-RestMethod -Method GET -Uri $Uri -Headers $Headers -ErrorAction Stop
-      } elseif ($Method -eq "POST") {
-        return Invoke-RestMethod -Method POST -Uri $Uri -Headers $Headers -Body $Body -ContentType "application/json" -ErrorAction Stop
-      } else { throw "Unsupported method: $Method" }
-    } catch {
-      $attempt++
-      $status = $null; $retryAfter = 0; $respBody = $null
-
-      # Extract status / Retry-After / response body for diagnostics
-      if ($_.Exception.Response) {
-       
