@@ -2,29 +2,12 @@
 Bulk assign Intune primary users based on last N days of sign-ins via Microsoft Graph REST.
 Features:
  - Token refresh on 401
- - Defensive paging with progress + max pages cap
- - Fallback (unfiltered) query if filtered returns no data
+ - Defensive paging with progress + max pages
+ - Fallback (unfiltered) query when filtered returns no data
  - Batched OR Parallel assignments (PS7+)
  - Per-item retries + backoff, detailed errors
  - File logging + CSV audit
  - Checkpoint resume (PowerShell 5.1 compatible)
-
-USAGE (safe preview first):
-.\BulkAssign-IntunePrimaryUsers.ps1 `
-  -TenantId "contoso.com" `
-  -ClientId "11111111-2222-3333-4444-555555555555" `
-  -ClientSecret "SuperSecretValue" `
-  -LookbackDays 30 `
-  -MinEventsPerDevice 3 `
-  -BatchSize 50 `
-  -MaxPages 100 `
-  -DryRun `
-  -UseParallel `
-  -ThrottleLimit 8 `
-  -LogPath "C:\Intune\PrimaryUser\bulkassign.log" `
-  -OutputDir "C:\Intune\PrimaryUser" `
-  -CheckpointPath "C:\Intune\PrimaryUser\checkpoint.json" `
-  -Resume
 #>
 
 param(
@@ -64,6 +47,9 @@ param(
   [int]$ThrottleLimit = 8
 )
 
+# -------------------- PS 5.1 TLS note (safe to run in PS7 too) --------------------
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
 # -------------------- Logging --------------------
 function Write-Log {
   param(
@@ -77,15 +63,16 @@ function Write-Log {
 # -------------------- Checkpoint helpers --------------------
 function Load-Checkpoint {
   param([string]$Path)
-  if (-not (Test-Path $Path)) { return @{} } # empty set
+  if (-not (Test-Path $Path)) { return @{} }
   try {
-    $data = Get-Content -Path $Path -ErrorAction Stop | Out-String | ConvertFrom-Json
+    $json = Get-Content -Path $Path -Raw -ErrorAction Stop
+    $data = ConvertFrom-Json -InputObject $json
     if ($data -is [array]) {
-      # convert to hashtable-like set for O(1) lookups
       $set = @{}
       foreach ($id in $data) { $set[$id] = $true }
       return $set
-    } else { return @{} }
+    }
+    return @{}
   } catch {
     Write-Log -Level WARN -Message "Failed to read checkpoint: $($_.Exception.Message). Starting fresh."
     return @{}
@@ -308,12 +295,216 @@ function Get-ManagedDeviceByAadId {
 $work = @()
 $idx  = 0
 foreach ($item in $assignments) {
-  $idx++; if ($idx % 100 -eq 0) { Write-Log -Level INFO -Message "Resolving managedDevices... processed $idx/$($assignments.Count)" }
+  $idx++
+  if ($idx % 100 -eq 0) { Write-Log -Level INFO -Message "Resolving managedDevices... processed $idx/$($assignments.Count)" }
+
   $resp = Get-ManagedDeviceByAadId -AadDeviceId $item.DeviceAadId -Headers $script:Headers -GraphEndpoint $GraphEndpoint
   $md   = $null
   if ($resp.value -and $resp.value.Count -ge 1) { $md = $resp.value[0] }
+
   if (-not $md) {
     $work += [pscustomobject]@{
-      DeviceAadId=$item.DeviceAadId; DeviceName=$item.DeviceName; ManagedDeviceId=$null; CurrentPrimaryUserId=$null;
-      TargetUserId=$item.TargetUserId; TargetUpn=$item.TargetUpn; EventCount=$item.EventCount; Action="Skip_NoManagedDevice";
-     
+      DeviceAadId          = $item.DeviceAadId
+      DeviceName           = $item.DeviceName
+      ManagedDeviceId      = $null
+      CurrentPrimaryUserId = $null
+      TargetUserId         = $item.TargetUserId
+      TargetUpn            = $item.TargetUpn
+      EventCount           = $item.EventCount
+      Action               = "Skip_NoManagedDevice"
+      Result               = "No Intune object found"
+      Attempts             = 0
+    }
+    continue
+  }
+
+  $action = if ($md.userId -eq $item.TargetUserId) { "Skip_AlreadyPrimary" } else { "Assign_PrimaryUser" }
+
+  $work += [pscustomobject]@{
+    DeviceAadId          = $item.DeviceAadId
+    DeviceName           = $md.deviceName
+    ManagedDeviceId      = $md.id
+    CurrentPrimaryUserId = $md.userId
+    TargetUserId         = $item.TargetUserId
+    TargetUpn            = $item.TargetUpn
+    EventCount           = $item.EventCount
+    Action               = $action
+    Result               = ""
+    Attempts             = 0
+  }
+}
+
+# -------------------- Checkpoint resume: load processed set -------------------
+$processedSet = @{}
+if ($Resume) {
+  $processedSet = Load-Checkpoint -Path $CheckpointPath
+  $already = ($processedSet.Keys | Measure-Object).Count
+  Write-Log -Level INFO -Message "Resume enabled. Loaded checkpoint with $already device IDs."
+}
+
+# ---------- Assignment helpers (retry + logging) ----------
+function Invoke-Assign {
+  param(
+    [Parameter(Mandatory)]$Row,
+    [hashtable]$Headers,
+    [int]$MaxRetries,
+    [int]$DelayMs,
+    [string]$GraphEndpoint,
+    [string]$LogPathLocal
+  )
+
+  function LogLocal([string]$lvl,[string]$msg) {
+    $ln = "$(Get-Date -Format o) [$lvl] $msg"
+    Add-Content -Path $LogPathLocal -Value $ln
+  }
+
+  if ($Row.Action -like "Skip_*") { $Row.Result = $Row.Action; return $Row }
+  if ($Row.TargetUserId -eq $null -or [string]::IsNullOrWhiteSpace($Row.TargetUserId)) {
+    $Row.Result = "Error: Missing TargetUserId"
+    return $Row
+  }
+
+  $attempt = 0
+  while ($attempt -lt [Math]::Max(1,$MaxRetries)) {
+    $attempt++
+    try {
+      $uri  = "$GraphEndpoint/v1.0/deviceManagement/managedDevices('$($Row.ManagedDeviceId)')/users/`$ref"
+      $body = @{ '@odata.id' = "$GraphEndpoint/v1.0/users/$($Row.TargetUserId)" } | ConvertTo-Json
+
+      try {
+        Invoke-RestMethod -Method POST -Uri $uri -Headers $Headers -Body $body -ContentType "application/json" -ErrorAction Stop | Out-Null
+        $Row.Result   = "Success_Assigned"
+        $Row.Attempts = $attempt
+        return $Row
+      } catch {
+        # Local token refresh on 401
+        $status = $null; $respBody = $null
+        if ($_.Exception.Response) {
+          $status = [int]$_.Exception.Response.StatusCode
+          try { $stream = $_.Exception.Response.GetResponseStream(); if ($stream) { $reader = New-Object System.IO.StreamReader($stream); $respBody = $reader.ReadToEnd() } } catch {}
+        }
+        if ($status -eq 401 -and ($respBody -match 'InvalidAuthenticationToken' -or $respBody -match 'token is expired' -or $respBody -match 'Lifetime validation failed')) {
+          LogLocal "WARN" "401 in worker; refreshing token and retrying attempt $attempt for device $($Row.ManagedDeviceId)."
+          $newTok = Get-GraphToken -TenantId $using:TenantId -ClientId $using:ClientId -ClientSecret $using:ClientSecret -GraphEndpoint $using:GraphEndpoint
+          $Headers["Authorization"] = "Bearer $newTok"
+          Start-Sleep -Milliseconds $DelayMs
+          continue
+        }
+        throw
+      }
+    } catch {
+      $msg = $_.Exception.Message
+      LogLocal "WARN" "Attempt $attempt failed for device $($Row.ManagedDeviceId): $msg"
+      if ($attempt -lt $MaxRetries) {
+        Start-Sleep -Milliseconds ([math]::Max($DelayMs, 100) * $attempt)  # linear backoff
+      } else {
+        $Row.Result   = "Error: $msg"
+        $Row.Attempts = $attempt
+        return $Row
+      }
+    }
+  }
+}
+
+# -------------------- Assignment: sequential batches or parallel -------------
+$results = @()
+$total   = $work.Count
+Write-Log -Level INFO -Message "Starting assignment phase for $total items. UseParallel=$UseParallel"
+
+# Filter out already processed (checkpoint) ONLY for real runs (not DryRun)
+if ($Resume -and -not $DryRun) {
+  $work = $work | Where-Object {
+    if ($_.ManagedDeviceId -and $processedSet.ContainsKey($_.ManagedDeviceId)) {
+      $_.Result = "Checkpoint_Skip"
+      $results += $_
+      $false
+    } else {
+      $true
+    }
+  }
+  Write-Log -Level INFO -Message "After resume filter, items remaining: $($work.Count)"
+}
+
+if ($UseParallel -and $PSVersionTable.PSVersion.Major -ge 7) {
+  # Handle skips
+  $skips = $work | Where-Object { $_.Action -like "Skip_*" }
+  foreach ($s in $skips) { $s.Result = $s.Action; $results += $s }
+  $toAssign = $work | Where-Object { $_.Action -eq "Assign_PrimaryUser" }
+
+  $authVal = $script:Headers['Authorization']
+  $assignedIds = New-Object System.Collections.Concurrent.ConcurrentBag[string]
+
+  $results += $toAssign | ForEach-Object -Parallel {
+      param($item)
+      $hdrs = @{ 'Authorization' = $using:authVal }
+      $out  = Invoke-Assign -Row $item -Headers $hdrs -MaxRetries $using:AssignmentMaxRetries `
+              -DelayMs $using:AssignmentDelayMs -GraphEndpoint $using:GraphEndpoint -LogPathLocal $using:LogPath
+      if ($out.Result -eq 'Success_Assigned' -and $out.ManagedDeviceId) { $using:assignedIds.Add($out.ManagedDeviceId) }
+      $out
+    } -ThrottleLimit ([Math]::Max(1,$ThrottleLimit))
+
+  # Save checkpoint once (successes only)
+  if (-not $DryRun) {
+    $existing = @()
+    if ($Resume) { $existing = $processedSet.Keys }
+    $finalSet = ($existing + $assignedIds.ToArray()) | Select-Object -Unique
+    Save-Checkpoint -Path $CheckpointPath -ManagedDeviceIds $finalSet
+  }
+
+} else {
+  # Sequential in batches with progress & pauses
+  $batches   = [Math]::Ceiling($work.Count / [Math]::Max(1,$BatchSize))
+  $processed = 0
+  $successIds = @()
+
+  for ($b = 0; $b -lt $batches; $b++) {
+    $start = $b * $BatchSize
+    $end   = [Math]::Min($start + $BatchSize, $work.Count)
+    $batch = $work[$start..($end-1)]
+
+    Write-Progress -Id 2 -Activity "Assigning primary users (batch $($b+1)/$batches)" -Status "Items $start..$(($end-1))" -PercentComplete ([Math]::Min(100,(($b+1)/$batches)*100))
+    Write-Log -Level INFO -Message "Processing batch $($b+1)/$batches (items $start..$(($end-1)))"
+
+    foreach ($row in $batch) {
+      if ($row.Action -like "Skip_*") { $row.Result = $row.Action; $results += $row; $processed++; continue }
+      if ($DryRun) { $row.Result = "DryRun_Assign_PrimaryUser"; $results += $row; $processed++; continue }
+
+      $localHeaders = @{'Authorization' = $script:Headers['Authorization']}
+      $out = Invoke-Assign -Row $row -Headers $localHeaders -MaxRetries $AssignmentMaxRetries `
+              -DelayMs $AssignmentDelayMs -GraphEndpoint $GraphEndpoint -LogPathLocal $LogPath
+      $results += $out
+      if ($out.Result -eq 'Success_Assigned' -and $out.ManagedDeviceId) { $successIds += $out.ManagedDeviceId }
+      $processed++
+      Start-Sleep -Milliseconds $AssignmentDelayMs
+    }
+
+    Write-Progress -Id 2 -Activity "Assigning primary users (batch $($b+1)/$batches)" -Completed
+
+    # Save checkpoint after each batch (successes only; cumulative)
+    if (-not $DryRun) {
+      $existing = @()
+      if ($Resume) { $existing = $processedSet.Keys }
+      $finalSet = ($existing + $successIds) | Select-Object -Unique
+      Save-Checkpoint -Path $CheckpointPath -ManagedDeviceIds $finalSet
+    }
+
+    if ($b -lt ($batches - 1) -and -not $DryRun) { Start-Sleep -Seconds $BatchPauseSeconds }
+  }
+}
+
+# -------------------- Export results -----------------------------------------
+$ts       = (Get-Date).ToString('yyyyMMdd_HHmmss')
+$csvPath  = Join-Path $OutputDir "PrimaryUserAssignment_$ts.csv"
+$errPath  = Join-Path $OutputDir "PrimaryUserAssignment_Errors_$ts.csv"
+
+$results | Export-Csv -NoTypeInformation -Path $csvPath
+$results | Where-Object { $_.Result -like 'Error:*' } | Export-Csv -NoTypeInformation -Path $errPath
+
+Write-Host "Completed. Results: $csvPath" -ForegroundColor Green
+if (Test-Path $errPath -and (Get-Item $errPath).Length -gt 0) {
+  Write-Host "Errors:   $errPath" -ForegroundColor Yellow
+  Write-Log -Level WARN -Message "Completed with errors. See $errPath"
+} else {
+  Remove-Item $errPath -ErrorAction SilentlyContinue
+  Write-Log -Level INFO -Message "Completed successfully."
+}
