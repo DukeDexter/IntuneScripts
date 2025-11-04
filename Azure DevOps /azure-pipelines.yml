@@ -1,0 +1,81 @@
+# Azure DevOps pipeline example that automates IPA provisioning profile expiry checks and sends alerts to Teams (and optionally fails the build if profiles are near expiry).
+
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  DaysThreshold: 30
+  TeamsWebhookUrl: $(TeamsWebhookUrl)   # Set in pipeline variables or Azure DevOps Library
+  AlertEmail: $(AlertEmail)             # Set in pipeline variables or Azure DevOps Library
+  SmtpServer: $(SmtpServer)             # SMTP server for email alerts
+
+steps:
+# 1. Download IPA artifact (replace with your source)
+- task: DownloadPipelineArtifact@2
+  inputs:
+    artifact: 'ios-app'
+    path: '$(Pipeline.Workspace)/ipa'
+
+# 2. Run PowerShell script to check provisioning profiles
+- task: PowerShell@2
+  displayName: 'Check IPA Provisioning Profiles'
+  inputs:
+    targetType: 'inline'
+    script: |
+      $IpaPath = "$(Pipeline.Workspace)/ipa/MyApp.ipa"
+      $DaysThreshold = $(DaysThreshold)
+      $TeamsWebhookUrl = "$(TeamsWebhookUrl)"
+      $AlertEmail = "$(AlertEmail)"
+      $SmtpServer = "$(SmtpServer)"
+
+      # Expand IPA
+      $TempDir = Join-Path $env:TEMP ("IPA_" + [System.Guid]::NewGuid().ToString())
+      Expand-Archive -Path $IpaPath -DestinationPath $TempDir
+
+      Write-Host "Checking provisioning profiles in $IpaPath..."
+      $Profiles = Get-ChildItem -Path $TempDir -Recurse -Filter "*.mobileprovision"
+      $Alerts = @()
+
+      foreach ($Profile in $Profiles) {
+          $Content = Get-Content $Profile.FullName
+          $Name = ($Content | Select-String -Pattern "<key>Name</key>" -Context 0,1).Context.PostContext -replace "<string>|</string>", ""
+          $AppID = ($Content | Select-String -Pattern "<key>application-identifier</key>" -Context 0,1).Context.PostContext -replace "<string>|</string>", ""
+          $Expiry = ($Content | Select-String -Pattern "<key>ExpirationDate</key>" -Context 0,1).Context.PostContext -replace "<date>|</date>", ""
+          $ExpiryDate = [datetime]$Expiry
+          $DaysLeft = ($ExpiryDate - (Get-Date)).Days
+
+          Write-Host ("Profile: {0} | AppID: {1} | Expiry: {2} | Days Left: {3}" -f $Name,$AppID,$ExpiryDate,$DaysLeft)
+
+          if ($DaysLeft -lt $DaysThreshold) {
+              $Alerts += @{
+                  Name = $Name
+                  AppID = $AppID
+                  Expiry = $ExpiryDate.ToString("yyyy-MM-dd")
+                  DaysLeft = $DaysLeft
+              }
+          }
+      }
+
+      Remove-Item -Recurse -Force $TempDir
+
+      if ($Alerts.Count -gt 0) {
+          $AlertText = "Provisioning Profiles expiring soon:`n" + ($Alerts | ForEach-Object { "$($_.Name) ($($_.AppID)) expires on $($_.Expiry) [$($_.DaysLeft) days left]" }) -join "`n"
+
+          # Email Alert
+          Send-MailMessage -To $AlertEmail -From "alerts@yourdomain.com" -Subject "IPA Provisioning Profile Expiry Alert" -Body $AlertText -SmtpServer $SmtpServer
+
+          # Teams Alert
+          $TeamsPayload = @{ text = $AlertText } | ConvertTo-Json
+          Invoke-RestMethod -Uri $TeamsWebhookUrl -Method Post -Body $TeamsPayload -ContentType 'application/json'
+
+          Write-Host "Alerts sent via Email and Teams."
+
+          # Fail build if profiles are expiring soon
+          Write-Error "One or more provisioning profiles are expiring within $DaysThreshold days."
+      } else {
+          Write-Host "No profiles expiring within $DaysThreshold days."
