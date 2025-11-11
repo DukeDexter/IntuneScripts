@@ -21,6 +21,8 @@ Writes detailed logs to %ProgramData%\Intune\Logs\PolicyRules-AIO.log
 
 #>
 
+# Script Start
+
 [CmdletBinding()]
 param(
     [ValidateSet('Detect','Remediate','Report')]
