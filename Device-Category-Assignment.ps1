@@ -4,6 +4,8 @@
  Method: PUT v1.0 …/managedDevices/{id}/deviceCategory/$ref (relationship binding)
  Verifies each update; exports pre-change list; includes simple retry/backoff.
 
+Author: Duke Dexter
+
 PowerShell script assigns Android/iOS, corporate‑owned managed devices to the “Intune – Corporately Owned Devices” category using the stable $ref relationship binding on Microsoft Graph v1.0, with verification, CSV export, and basic retry/backoff.
 
 Prerequisites
