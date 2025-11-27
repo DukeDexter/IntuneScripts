@@ -1,5 +1,8 @@
 
 <#
+
+Author: Duke Dexter (https://github.com/DukeDexter)
+
 .SYNOPSIS
   This owerShell script configures Automatic Time Zone "Set time zone automatically" and Location access at the device level, with built‑in verification, logging, and Intune‑friendly exit codes.
 
