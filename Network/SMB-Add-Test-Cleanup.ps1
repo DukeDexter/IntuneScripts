@@ -2,7 +2,7 @@
 <#
 .SYNOPSIS
   Temporarily allow inbound SMB (TCP 445), test connectivity, and auto-remove the rule.
-  The Server Message Block (SMB) protocol uses specific ports for file and printer sharing. Below are the key SMB ports and steps to configure them:
+  The Server Message Block (SMB) protocol uses specific ports for file and printer sharing. Below are the key SMB ports:
   Key SMB Ports
     Port 445: Used for direct SMB communication over TCP/IP without NetBIOS. This is the default and recommended port for modern Windows systems.
     Port 139: Used for SMB communication over NetBIOS (legacy support).
