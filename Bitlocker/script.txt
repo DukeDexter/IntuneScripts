@@ -14,8 +14,7 @@
     .\FindDevicesMissingBitLockerKeys.ps1
 
 .NOTES
-    Author: Eswar Koneti (original)
-    Updated by: M365 Copilot for Himanshu (console-safe + resilience + output suppression)
+    Author: Duke Dexter
     Date: 23-Dec-2025
     Requires:
       - PowerShell 5.1+ / 7+
