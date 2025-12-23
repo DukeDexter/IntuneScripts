@@ -25,7 +25,6 @@ Always produces a run artifact CSV (empty or header‑only if no issues).
 
 .NOTES
     Author: Duke Dexter (https://github.com/DukeDexter)
-    Updated by: M365 Copilot for Himanshu (console-safe + resilience + output suppression)
     Date: 23-Dec-2025
     Requires:
       - PowerShell 5.1+ / 7+
